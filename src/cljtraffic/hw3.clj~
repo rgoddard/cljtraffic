@@ -1,0 +1,21 @@
+(ns cljtraffic.hw3
+  (:use [clojure.contrib.generic.math-functions :only (pow sin)]))
+
+(def threshold (expt 10 -5))
+
+(defn calc-next [cur-mat]
+  cur-mat)
+
+(defn norm [mat-a mat-b]
+  0)
+
+(defn converged? [mat-a mat-b]
+  (< (norm next-mat calc-next) threshold))
+
+(defn run-calc [cur-mat next-mat num-steps]
+  (if (converged? cur-mat next-mat)
+    [num-steps next-mat]
+    (recur next-mat (calc-next next-mat) (inc num-steps))))
+
+(defn init-mat [size]
+  
