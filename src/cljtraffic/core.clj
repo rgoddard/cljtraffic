@@ -1,4 +1,5 @@
 (ns cljtraffic.core (:gen-class)
+    (:use clojure.contrib.profile)
     (:import (javax.swing JFrame JPanel JOptionPane)
 	   (java.awt Color Graphics)
 	   (java.awt.image BufferedImage)))
@@ -9,45 +10,64 @@
 ;;Probability a person will randomly slow down
 (def p-dec 0.25)
 (def dim-screen [800 30])
+(def my-map map)
 
 (defstruct vehicle :vel :pref-vel :pos :id)
-(defstruct cell :car)
 
-(defn fmap [f coll] (doall (map f coll)))
 (defn create-car [pos id]
   (struct vehicle 0 5 pos id))
 
-(defn create-lane [length]
+(defn create-lane-cond [length cond-create]
+  ;creates a lane of the given length, a cell will only contain a car if cond-create evaluates to true
   (let [id (atom 0)]
-    (apply vector (map
-		   (fn [n] (if (< (rand) 0.35) (create-car n (swap! id inc)) nil))
-		   (range length)))))
+    (apply vector (doall (map
+     (fn [n] (if (cond-create n) (create-car n (swap! id inc)) nil))
+     (range length))))))
 
-(defn gap [pos num-ahead coll]
-  (let [size (count coll)
-	end (inc num-ahead)
+(defn create-lane [length]
+  (create-lane-cond length (fn [_] (< (rand) 0.35))))
+
+(defn create-lane-third [length]
+  (create-lane-cond length (fn [n] (= 0 (mod n 3)))))
+
+(defn gap [pos num-ahead lane size]
+  (let [end (inc num-ahead)
 	g (first (drop-while 
 		  (fn [n] (and 
 			   (< n end) 
-			   (nil? (nth coll (mod (+ pos n) size)))))
+			   (prof :gap-nth (nil? (nth lane (mod (+ pos n) size))))))
 		  (range 1 end)))]
     (if (nil? g) num-ahead (dec g))))
 
-(defn update-velocity [car coll]
-  (let [v1 (if (< (:vel car) (:pref-vel car)) (inc (:vel car)) (:vel car))]
-    (let [g (gap (:pos car) (:pref-vel car) coll)
-	  v2 (if (> v1 g) g v1)]
-      (let [v3 (if (and (> 0 v2) (< (rand) p-dec)) (dec v2) v2)]
-	(assoc car :vel v3 :pos (mod (+ (:pos car) v3) (count coll)))))))
+(defn update-velocity [car pos lane size]
+  (let [vel (:vel car) pref-vel (:pref-vel car)
+	v1 (prof :v1 (if (< vel pref-vel) (inc vel) vel))]
+    (let [g (prof :gap (gap pos pref-vel lane size))
+	  v2 (prof :v2 (if (> v1 g) g v1))]
+      (let [v3 (prof :v3 (if (and (> 0 v2) (< (rand) p-dec)) (dec v2) v2))]
+	(prof :assoc-vel (assoc car :vel v3))))))
 
-(defn update-position [car]
-  (assoc car :pos (+ (:pos car) (:vel car))))
 
-(defn update-lane-velocities [coll]
-  (apply vector (map (fn [cell] (if (nil? cell)
-		    cell
-		    (update-velocity cell coll)))
-		     coll)))
+(defn update-velocities
+  ([lane]
+     (update-velocities lane (range (count lane)) (count lane)))
+  ([lane map-coll size]
+     (vec (my-map (fn [pos]
+	       (let [cell (nth lane pos)]
+		 (if (nil? cell)
+		   cell
+		   (update-velocity cell pos lane size))))
+	     map-coll))))
+
+(defn update-array-velocities [arr]
+  (let [size (count arr)]
+    (loop [ix 0]
+      (if (= ix size)
+	arr
+	(do 
+	  (if (not (nil? (nth arr ix)))
+	      (aset arr ix (update-velocity (nth arr ix) arr size)))
+	    (recur (inc ix)))))))
 
 (defn get-car-at [coll pos max-vel]
   (if (> 0 max-vel) nil
@@ -56,12 +76,76 @@
 	  car
 	  (recur coll pos (dec max-vel))))))
       
-(defn update-lane-positions [coll]
-  (apply vector (map #(get-car-at coll % 5) (range (count coll)))))
+(defn update-positions
+  ([lane]
+     (update-positions lane (range (count lane))))
+  ([lane map-coll]
+     (my-map #(get-car-at lane % 5) map-coll)))
 
-(defn update-lane [coll]
-   (doall (update-lane-positions (update-lane-velocities coll))))
-		      
+(defn update-lane
+  ([lane]
+     (update-lane lane (range (count lane)) (count lane)))
+  ([lane map-coll size]
+     (doall (update-positions (update-velocities lane map-coll size) map-coll))))
+
+(defn lane-app [size partition-size]
+  (let [lane (create-lane-third size)
+	map-coll (doall (if partition-size
+			  (partition-all partition-size (range 0 100000))
+			  (range 0 100000)))]
+    {:lane (atom lane)
+     :update-lane (fn [] (update-lane @lane map-coll size))}))
+     
+					;Timing and testing map
+
+(def num-threads (atom 1))
+(defn set-num-threads [n]
+  (swap! num-threads (fn [_] n)))
+
+(defn omp-pmap 
+  "works similar to pmap, except number of threads given by num_threads, instead of num procs + 2.
+To change the number of threads call set_num_threads"
+  [f coll]
+  (let [n @num-threads
+         rets (map #(future (f %)) coll)
+         step (fn step [[x & xs :as vs] fs]
+                (lazy-seq
+                 (if-let [s (seq fs)]
+                   (cons (deref x) (step xs (rest s)))
+                   (map deref vs))))]
+     (step rets (drop n rets))))
+
+(defn omp-pmap-part
+  "Takes a function f and sequence that has already been partitioned, and for each chunk in the sequence,
+maps over the chunk with f, returns as a single sequence"
+  [f coll]
+  (apply concat (omp-pmap (fn [chunk] (doall (map f chunk))) coll)))
+
+(def part-size 200)
+(defn pmap-part
+  ([f coll]
+     (pmap-part f coll part-size))
+  ([f coll size]
+     (pmap-part f coll part-size (partition-all size coll)))
+  ([f coll size part]
+     (apply concat (pmap (fn [chunk] (map f chunk)) part))))
+
+(defn time-test [lane map-fn]
+  (time (first (binding [my-map map-fn] (update-lane lane)))))
+
+(defn time-test-map [lane]
+  (time-test lane map))
+
+(defn time-test-pmap [lane]
+  (time-test lane pmap))
+
+(defn time-test-part [lane]
+  (time-test lane pmap-part))
+
+
+					;For graphical display...
+
+(defn fmap [f coll] (doall (map f coll)))
 (defn render-cell [#^Graphics g car scale frame-scale]
   (let [pos (:pos car)
 	vel (:vel car)
@@ -93,6 +177,11 @@
     (render-frame surface fps i frame-num))))
   
 (def cont (atom true))
+(defn reset-cont []
+  (swap! cont (fn [_] true)))
+(defn stop-cont []
+  (swap! cont (fn [_] nil)))
+
 (defn activity-loop [surface lane fps frame-num]
   (while @cont
     (swap! lane update-lane)
