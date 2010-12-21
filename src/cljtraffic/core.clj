@@ -7,6 +7,30 @@
 (defn -main [& args]
   (println (str "Available Processors: " (.availableProcessors (Runtime/getRuntime)))))
 
+
+(def num-threads (atom 1))
+(defn set-num-threads [n]
+  (swap! num-threads (fn [_] n)))
+
+(defn omp-pmap 
+  "works similar to pmap, except number of threads given by num_threads, instead of num procs + 2.
+To change the number of threads call set_num_threads"
+  [f coll]
+  (let [n @num-threads
+         rets (map #(future (f %)) coll)
+         step (fn step [[x & xs :as vs] fs]
+                (lazy-seq
+                 (if-let [s (seq fs)]
+                   (cons (deref x) (step xs (rest s)))
+                   (map deref vs))))]
+     (step rets (drop n rets))))
+
+(defn omp-pmap-part
+  "Takes a function f and sequence that has already been partitioned, and for each chunk in the sequence,
+maps over the chunk with f, returns as a single sequence"
+  [f coll]
+  (apply concat (omp-pmap (fn [chunk] (doall (map f chunk))) coll)))
+
 ;;Probability a person will randomly slow down
 (def p-dec 0.25)
 (def dim-screen [800 30])
@@ -72,7 +96,7 @@
 (defn get-car-at [coll pos max-vel]
   (if (> 0 max-vel) nil
       (let [car (nth coll (mod (- pos max-vel) (count coll)))]
-	(if (and (not (nil? car)) (= pos (:pos car)))
+	(if (and (not (nil? car)) (= max-vel (:vel car)))
 	  car
 	  (recur coll pos (dec max-vel))))))
       
@@ -80,7 +104,7 @@
   ([lane]
      (update-positions lane (range (count lane))))
   ([lane map-coll]
-     (my-map #(get-car-at lane % 5) map-coll)))
+     (vec (my-map #(get-car-at lane % 5) map-coll))))
 
 (defn update-lane
   ([lane]
@@ -88,38 +112,45 @@
   ([lane map-coll size]
      (doall (update-positions (update-velocities lane map-coll size) map-coll))))
 
-(defn lane-app [size partition-size]
-  (let [lane (create-lane-third size)
-	map-coll (doall (if partition-size
-			  (partition-all partition-size (range 0 100000))
-			  (range 0 100000)))]
-    {:lane (atom lane)
-     :update-lane (fn [] (update-lane @lane map-coll size))}))
-     
+(defn lane-app [size num-partitions]
+  (let [lane (atom (create-lane-third size))
+	[map-coll map-fn] (if (and num-partitions (> num-partitions 1))
+			    [(doall (partition-all (/ size num-partitions) (range size))) omp-pmap-part]
+			    [(doall (range size)) map])]
+    {:lane lane
+     :map-coll map-coll
+     :map-fn map-fn
+     :update-lane (fn [] (swap! lane 
+				(fn [l]
+				  (binding [my-map map-fn] (update-lane l map-coll size)))))}))
+
+(defn benchmark
+  ([]
+     (benchmark [10 100 200] [1 2 4] 1000))
+  ([sizes threads iter]
+     (map (fn [size]
+	    (map (fn [num-threads]
+		   (let [test-app (lane-app size num-threads)
+			 start (. System (nanoTime))
+			 ret (dotimes [n iter] ((:update-lane test-app)))]
+		     {:time-secs (/ (double (- (. System (nanoTime)) start)) 1000000000.0)
+		      :size size
+		      :iter iter
+		      :threads num-threads}))
+		 threads))
+	  sizes)))
+
+(defn display-results [res]
+  (do
+    (doall
+     (map (fn [threads]
+	    (doall (map (fn [trial]
+		   (println (str trial)))
+		 threads)))
+	  res))
+    nil))
+	   
 					;Timing and testing map
-
-(def num-threads (atom 1))
-(defn set-num-threads [n]
-  (swap! num-threads (fn [_] n)))
-
-(defn omp-pmap 
-  "works similar to pmap, except number of threads given by num_threads, instead of num procs + 2.
-To change the number of threads call set_num_threads"
-  [f coll]
-  (let [n @num-threads
-         rets (map #(future (f %)) coll)
-         step (fn step [[x & xs :as vs] fs]
-                (lazy-seq
-                 (if-let [s (seq fs)]
-                   (cons (deref x) (step xs (rest s)))
-                   (map deref vs))))]
-     (step rets (drop n rets))))
-
-(defn omp-pmap-part
-  "Takes a function f and sequence that has already been partitioned, and for each chunk in the sequence,
-maps over the chunk with f, returns as a single sequence"
-  [f coll]
-  (apply concat (omp-pmap (fn [chunk] (doall (map f chunk))) coll)))
 
 (def part-size 200)
 (defn pmap-part
